@@ -6,9 +6,11 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Any
 
+import av
 import numpy as np
 import sounddevice as sd
 from aiohttp import web, WSMsgType
+from aiortc import RTCPeerConnection, RTCSessionDescription
 
 HTTP_HOST = "0.0.0.0"
 HTTP_PORT = 9000
@@ -19,11 +21,11 @@ SAMPLES_PER_FRAME = int(TARGET_SR * FRAME_MS / 1000)
 
 DEFAULT_CHANNEL_GAIN = 1.0
 DEFAULT_MASTER_GAIN = 1.0
-DEFAULT_LIMITER_CEILING = 0.98  # 0..1 (float)
-DEFAULT_GATE_THRESHOLD_RMS = 0.02  # 0..1, bem leve (opcional)
-DEFAULT_GATE_ATTENUATION = 0.15  # quando abaixo do threshold, reduz para 15%
+DEFAULT_LIMITER_CEILING = 0.98
+DEFAULT_GATE_THRESHOLD_RMS = 0.00
+DEFAULT_GATE_ATTENUATION = 0.15
 
-MAX_QUEUE_FRAMES = 200  # ~4s de áudio (200 * 20ms)
+MAX_QUEUE_FRAMES = 10
 
 # =========================
 # HTML (client + mixer)
@@ -40,12 +42,12 @@ CLIENT_HTML = f"""<!doctype html>
     .row {{ margin: 12px 0; }}
     button, input {{ font-size: 16px; padding: 10px 12px; }}
     input {{ width: 100%; max-width: 420px; }}
-    pre {{ background:#f4f4f4; padding:12px; border-radius:10px; }}
+    pre {{ background:#f4f4f4; padding:12px; border-radius:10px; white-space: pre-wrap; }}
     .hint {{ color:#444; font-size: 14px; }}
   </style>
 </head>
 <body>
-  <h2>Enviar microfone do celular para o Hub</h2>
+  <h2>Enviar microfone do celular para o Hub (WebRTC/Opus)</h2>
 
   <div class="row">
     <label>Channel ID</label><br>
@@ -67,94 +69,59 @@ CLIENT_HTML = f"""<!doctype html>
   const stopBtn = document.getElementById("stop");
   const chEl = document.getElementById("ch");
 
-  let ws = null;
-  let audioCtx = null;
-  let processor = null;
-  let source = null;
+  let pc = null;
   let stream = null;
-
-  const TARGET_SR = {TARGET_SR};
-  const FRAME_MS = {FRAME_MS};
-  const SAMPLES_PER_FRAME = Math.round(TARGET_SR * FRAME_MS / 1000);
 
   function log(s) {{ logEl.textContent = s; }}
 
-  function floatToInt16PCM(float32) {{
-    const buf = new ArrayBuffer(float32.length * 2);
-    const view = new DataView(buf);
-    for (let i = 0; i < float32.length; i++) {{
-      let x = float32[i];
-      x = Math.max(-1, Math.min(1, x));
-      const s = x < 0 ? x * 0x8000 : x * 0x7FFF;
-      view.setInt16(i * 2, s, true);
-    }}
-    return new Uint8Array(buf);
-  }}
-
   async function start() {{
-      const ch = parseInt(chEl.value || "1", 10);
-      const proto = (location.protocol === "https:") ? "wss" : "ws";
-      const wsUrl = `${{proto}}://${{location.host}}/ws_audio?ch=${{encodeURIComponent(ch)}}`;
+    const ch = parseInt(chEl.value || "1", 10);
 
-      log("Pedindo permissão do microfone...");
-      stream = await navigator.mediaDevices.getUserMedia({{
-        audio: {{
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true
-        }}
-      }});
+    log("Pedindo permissão do microfone...");
+    stream = await navigator.mediaDevices.getUserMedia({{
+      audio: {{
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true
+      }},
+      video: false
+    }});
 
-      ws = new WebSocket(wsUrl);
-      ws.binaryType = "arraybuffer";
-      ws.onopen = () => log(`Conectado. Enviando áudio no canal ${{ch}}...`);
-      ws.onclose = () => log("WebSocket fechado.");
-      ws.onerror = () => log("Erro WebSocket.");
+    // WebRTC peer connection
+    pc = new RTCPeerConnection({{
+      iceServers: [] // LAN: geralmente vazio é ok. Se for internet, adicione STUN/TURN.
+    }});
 
-    audioCtx = new (window.AudioContext || window.webkitAudioContext)({{ sampleRate: TARGET_SR }});
-    source = audioCtx.createMediaStreamSource(stream);
-
-    const bufferSize = 1024; // MVP
-    processor = audioCtx.createScriptProcessor(bufferSize, 1, 1);
-
-    let stash = [];
-    let stashLen = 0;
-
-    processor.onaudioprocess = (ev) => {{
-      if (!ws || ws.readyState !== WebSocket.OPEN) return;
-      const input = ev.inputBuffer.getChannelData(0);
-
-      stash.push(input.slice());
-      stashLen += input.length;
-
-      while (stashLen >= SAMPLES_PER_FRAME) {{
-        const frame = new Float32Array(SAMPLES_PER_FRAME);
-        let filled = 0;
-
-        while (filled < SAMPLES_PER_FRAME && stash.length) {{
-          const head = stash[0];
-          const need = SAMPLES_PER_FRAME - filled;
-
-          if (head.length <= need) {{
-            frame.set(head, filled);
-            filled += head.length;
-            stash.shift();
-          }} else {{
-            frame.set(head.subarray(0, need), filled);
-            stash[0] = head.subarray(need);
-            filled += need;
-          }}
-        }}
-
-        stashLen -= SAMPLES_PER_FRAME;
-        const pcmBytes = floatToInt16PCM(frame);
-        ws.send(pcmBytes);
-      }}
+    pc.onconnectionstatechange = () => {{
+      log("Estado: " + pc.connectionState);
     }};
 
-    source.connect(processor);
-    processor.connect(audioCtx.destination);
+    // manda track de audio
+    stream.getTracks().forEach(t => pc.addTrack(t, stream));
 
+    const offer = await pc.createOffer({{ offerToReceiveAudio: false, offerToReceiveVideo: false }});
+    await pc.setLocalDescription(offer);
+
+    log("Enviando offer para o servidor...");
+    const res = await fetch("/offer", {{
+      method: "POST",
+      headers: {{ "Content-Type": "application/json" }},
+      body: JSON.stringify({{
+        sdp: pc.localDescription.sdp,
+        type: pc.localDescription.type,
+        ch
+      }})
+    }});
+
+    if (!res.ok) {{
+      const t = await res.text();
+      throw new Error("Falha no /offer: " + t);
+    }}
+
+    const answer = await res.json();
+    await pc.setRemoteDescription(answer);
+
+    log("Conectado. Transmitindo áudio no canal " + ch + ".");
     startBtn.disabled = true;
     stopBtn.disabled = false;
   }}
@@ -163,15 +130,17 @@ CLIENT_HTML = f"""<!doctype html>
     startBtn.disabled = false;
     stopBtn.disabled = true;
 
-    if (processor) {{ processor.disconnect(); processor = null; }}
-    if (source) {{ source.disconnect(); source = null; }}
-    if (audioCtx) {{ await audioCtx.close(); audioCtx = null; }}
-    if (ws) {{ ws.close(); ws = null; }}
+    if (pc) {{
+      try {{ pc.getSenders().forEach(s => s.track && s.track.stop()); }} catch(e) {{}}
+      try {{ await pc.close(); }} catch(e) {{}}
+      pc = null;
+    }}
 
     if (stream) {{
       stream.getTracks().forEach(t => t.stop());
       stream = null;
     }}
+
     log("Parado.");
   }}
 
@@ -207,7 +176,7 @@ MIXER_HTML = """<!doctype html>
   </style>
 </head>
 <body>
-  <h2>Mixer (Mesa de som do Hub)</h2>
+  <h2>Mixer</h2>
 
   <div class="top">
     <div class="card">
@@ -230,15 +199,6 @@ MIXER_HTML = """<!doctype html>
       </div>
       <div class="row small" id="status">Conectando...</div>
     </div>
-
-    <div class="card">
-      <div class="title">Como usar</div>
-      <div class="small">
-        1) No celular, abra <b>/client</b> e escolha um Channel ID.<br>
-        2) No PC, ajuste volume, mute/solo e veja os meters aqui.<br>
-        3) Se ninguém fala e o ambiente fica “somando”, aumente um pouco o Gate (ou mute canais ociosos).
-      </div>
-    </div>
   </div>
 
   <div class="channels" id="channels"></div>
@@ -260,10 +220,6 @@ MIXER_HTML = """<!doctype html>
 
   const refreshBtn = document.getElementById("refresh");
 
-  const state = {
-    channels: {}
-  };
-
   function send(obj) {
     if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
   }
@@ -276,7 +232,7 @@ MIXER_HTML = """<!doctype html>
       el.className = "card ch";
       el.id = `ch_${id}`;
       el.innerHTML = `
-        <div class="title">CH ${id} <span class="small" id="name_${id}"></span></div>
+        <div class="title">CH ${id}</div>
 
         <div class="row">
           <label>Gain: <span id="gainVal_${id}">1.00</span></label>
@@ -302,15 +258,10 @@ MIXER_HTML = """<!doctype html>
         send({ type: "set_channel", id, gain: Number(gainEl.value) });
       };
 
-      document.getElementById(`mute_${id}`).onclick = () => {
-        send({ type: "toggle_mute", id });
-      };
-      document.getElementById(`solo_${id}`).onclick = () => {
-        send({ type: "toggle_solo", id });
-      };
+      document.getElementById(`mute_${id}`).onclick = () => send({ type: "toggle_mute", id });
+      document.getElementById(`solo_${id}`).onclick = () => send({ type: "toggle_solo", id });
     }
 
-    // update view
     document.getElementById(`gain_${id}`).value = ch.gain.toFixed(2);
     document.getElementById(`gainVal_${id}`).textContent = ch.gain.toFixed(2);
     document.getElementById(`mute_${id}`).textContent = ch.muted ? "Muted" : "Mute";
@@ -335,14 +286,10 @@ MIXER_HTML = """<!doctype html>
     ceilingVal.textContent = Number(ceiling.value).toFixed(2);
     gateVal.textContent = Number(gate.value).toFixed(3);
 
-    // render channels
     payload.channels.sort((a,b) => a.id - b.id).forEach(renderChannel);
   }
 
-  ws.onopen = () => {
-    statusEl.textContent = "Conectado. Carregando...";
-    send({ type: "get_state" });
-  };
+  ws.onopen = () => { statusEl.textContent = "Conectado. Carregando..."; send({ type: "get_state" }); };
   ws.onclose = () => statusEl.textContent = "Desconectado.";
   ws.onerror = () => statusEl.textContent = "Erro no WebSocket.";
 
@@ -352,18 +299,9 @@ MIXER_HTML = """<!doctype html>
     if (msg.type === "tick") renderAll(msg.payload);
   };
 
-  masterGain.oninput = () => {
-    masterGainVal.textContent = Number(masterGain.value).toFixed(2);
-    send({ type: "set_master", master_gain: Number(masterGain.value) });
-  };
-  ceiling.oninput = () => {
-    ceilingVal.textContent = Number(ceiling.value).toFixed(2);
-    send({ type: "set_master", limiter_ceiling: Number(ceiling.value) });
-  };
-  gate.oninput = () => {
-    gateVal.textContent = Number(gate.value).toFixed(3);
-    send({ type: "set_master", gate_threshold: Number(gate.value) });
-  };
+  masterGain.oninput = () => { masterGainVal.textContent = Number(masterGain.value).toFixed(2); send({ type: "set_master", master_gain: Number(masterGain.value) }); };
+  ceiling.oninput = () => { ceilingVal.textContent = Number(ceiling.value).toFixed(2); send({ type: "set_master", limiter_ceiling: Number(ceiling.value) }); };
+  gate.oninput = () => { gateVal.textContent = Number(gate.value).toFixed(3); send({ type: "set_master", gate_threshold: Number(gate.value) }); };
 
   refreshBtn.onclick = () => send({ type: "get_state" });
 })();
@@ -371,7 +309,6 @@ MIXER_HTML = """<!doctype html>
 </body>
 </html>
 """
-
 
 # =========================
 # Mixer State
@@ -383,12 +320,10 @@ class ChannelState:
     gain: float = DEFAULT_CHANNEL_GAIN
     muted: bool = False
     solo: bool = False
-    # buffer de frames int16 (mono)
     q: "queue.Queue[np.ndarray]" = field(default_factory=lambda: queue.Queue(maxsize=MAX_QUEUE_FRAMES))
     drops: int = 0
-    level: float = 0.0  # 0..1 (RMS aproximado)
+    level: float = 0.0
     last_seen: float = field(default_factory=time.time)
-
 
 @dataclass
 class MasterState:
@@ -402,11 +337,14 @@ class HubMixer:
     def __init__(self):
         self.channels: Dict[int, ChannelState] = {}
         self.master = MasterState()
-        self._lock = asyncio.Lock()
         self._ctrl_clients: set[web.WebSocketResponse] = set()
 
         self._audio_stream: Optional[sd.OutputStream] = None
         self._running = False
+
+        # peers webRTC
+        self._pcs: set[RTCPeerConnection] = set()
+        self._track_tasks: Dict[RTCPeerConnection, asyncio.Task] = {}
 
     def get_or_create_channel(self, ch_id: int) -> ChannelState:
         ch = self.channels.get(ch_id)
@@ -415,45 +353,40 @@ class HubMixer:
             self.channels[ch_id] = ch
         return ch
 
-    def push_audio_frame(self, ch_id: int, payload: bytes) -> None:
-        # payload é PCM int16 LE mono, exatamente 20ms (ideal)
+    def push_audio_i16_frame(self, ch_id: int, frame_i16: np.ndarray) -> None:
+        """
+        frame_i16: int16 mono com tamanho SAMPLES_PER_FRAME (20ms).
+        """
         ch = self.get_or_create_channel(ch_id)
         ch.last_seen = time.time()
 
-        frame = np.frombuffer(payload, dtype=np.int16)
+        if frame_i16.shape[0] < SAMPLES_PER_FRAME:
+            frame_i16 = np.pad(frame_i16, (0, SAMPLES_PER_FRAME - frame_i16.shape[0]))
+        elif frame_i16.shape[0] > SAMPLES_PER_FRAME:
+            frame_i16 = frame_i16[:SAMPLES_PER_FRAME]
 
-        if frame.size < SAMPLES_PER_FRAME:
-            frame = np.pad(frame, (0, SAMPLES_PER_FRAME - frame.size))
-        elif frame.size > SAMPLES_PER_FRAME:
-            frame = frame[:SAMPLES_PER_FRAME]
-
-        # nível RMS (para meter)
-        f = frame.astype(np.float32) / 32768.0
+        # meter RMS
+        f = frame_i16.astype(np.float32) / 32768.0
         rms = float(np.sqrt(np.mean(f * f) + 1e-12))
         ch.level = min(1.0, rms)
 
         try:
-            ch.q.put_nowait(frame)
+            ch.q.put_nowait(frame_i16)
         except queue.Full:
             ch.drops += 1
-            # descarta um antigo pra não aumentar latência
             try:
                 _ = ch.q.get_nowait()
             except queue.Empty:
                 pass
             try:
-                ch.q.put_nowait(frame)
+                ch.q.put_nowait(frame_i16)
             except queue.Full:
                 pass
 
     def _mix_block(self, frames: int) -> np.ndarray:
-        """
-        Retorna float32 mono [-1..1] com frames amostras.
-        """
         if not self.channels:
             return np.zeros((frames,), dtype=np.float32)
 
-        # solo logic
         solo_any = any(ch.solo for ch in self.channels.values())
         active = []
         for ch in self.channels.values():
@@ -483,22 +416,17 @@ class HubMixer:
 
             x = frame_i16.astype(np.float32) / 32768.0
 
-            # gate simples (opcional)
             gt = self.master.gate_threshold
             if gt > 0:
                 rms = float(np.sqrt(np.mean(x * x) + 1e-12))
                 if rms < gt:
                     x *= self.master.gate_attenuation
 
-            # ganho por canal
             x *= float(ch.gain)
-
             mix += x
 
-        # master gain
         mix *= float(self.master.master_gain)
 
-        # limiter simples (hard clip no ceiling)
         ceiling = float(self.master.limiter_ceiling)
         ceiling = max(0.05, min(1.0, ceiling))
         mix = np.clip(mix, -ceiling, ceiling)
@@ -507,18 +435,16 @@ class HubMixer:
 
     def _audio_callback(self, outdata, frames, time_info, status):
         block = self._mix_block(frames)
-        # sounddevice espera shape (frames, channels)
         outdata[:] = block.reshape(-1, 1)
 
     def start_audio(self):
         if self._audio_stream is not None:
             return
-
         self._audio_stream = sd.OutputStream(
             samplerate=TARGET_SR,
             channels=1,
             dtype="float32",
-            blocksize=SAMPLES_PER_FRAME,  # 20ms
+            blocksize=SAMPLES_PER_FRAME,
             callback=self._audio_callback,
         )
         self._audio_stream.start()
@@ -554,7 +480,6 @@ class HubMixer:
         }
 
     async def broadcast_tick(self):
-        # envia updates periódicos pros painéis conectados
         payload = self.state_payload()
         dead = []
         for ws in self._ctrl_clients:
@@ -565,9 +490,89 @@ class HubMixer:
         for ws in dead:
             self._ctrl_clients.discard(ws)
 
+    # =========================
+    # WebRTC receive pipeline
+    # =========================
+
+    async def add_webrtc_peer(self, ch_id: int, offer: RTCSessionDescription) -> RTCSessionDescription:
+        pc = RTCPeerConnection()
+        self._pcs.add(pc)
+
+        # resampler: qualquer coisa -> mono, 48k, s16
+        resampler = av.AudioResampler(format="s16", layout="mono", rate=TARGET_SR)
+
+        @pc.on("connectionstatechange")
+        async def on_state():
+            if pc.connectionState in ("failed", "closed", "disconnected"):
+                await self._cleanup_pc(pc)
+
+        @pc.on("track")
+        def on_track(track):
+            if track.kind != "audio":
+                return
+
+            print(f"[WebRTC] audio track recebida: ch={ch_id}")
+
+            async def pump():
+                # buffer pra formar frames fixos de 20ms
+                stash = np.zeros((0,), dtype=np.int16)
+                try:
+                    while True:
+                        frame = await track.recv()  # av.AudioFrame
+                        # resample -> lista de frames (às vezes pode retornar 0..N)
+                        for f in resampler.resample(frame):
+                            # f é s16 mono
+                            arr = f.to_ndarray()
+                            # arr pode vir como (samples,) ou (1, samples); normaliza:
+                            if arr.ndim == 2:
+                                arr = arr[0]
+                            arr = arr.astype(np.int16, copy=False)
+
+                            if arr.size == 0:
+                                continue
+
+                            stash = np.concatenate([stash, arr])
+
+                            while stash.size >= SAMPLES_PER_FRAME:
+                                chunk = stash[:SAMPLES_PER_FRAME]
+                                stash = stash[SAMPLES_PER_FRAME:]
+                                self.push_audio_i16_frame(ch_id, chunk)
+                except Exception as e:
+                    # normalmente cai aqui quando peer fecha / track termina
+                    print(f"[WebRTC] pump encerrado ch={ch_id}: {e!r}")
+
+            task = asyncio.create_task(pump())
+            self._track_tasks[pc] = task
+
+        await pc.setRemoteDescription(offer)
+        answer = await pc.createAnswer()
+        await pc.setLocalDescription(answer)
+        return pc.localDescription
+
+    async def _cleanup_pc(self, pc: RTCPeerConnection):
+        if pc in self._track_tasks:
+            t = self._track_tasks.pop(pc)
+            t.cancel()
+            try:
+                await t
+            except Exception:
+                pass
+
+        if pc in self._pcs:
+            self._pcs.discard(pc)
+
+        try:
+            await pc.close()
+        except Exception:
+            pass
+
+    def prune_inactive_channels(self, ttl_seconds: float = 3.0) -> None:
+        now = time.time()
+        dead = [ch_id for ch_id, ch in self.channels.items() if (now - ch.last_seen) > ttl_seconds]
+        for ch_id in dead:
+            del self.channels[ch_id]
 
 hub = HubMixer()
-
 
 # =========================
 # HTTP Handlers
@@ -576,45 +581,29 @@ hub = HubMixer()
 async def page_client(_request: web.Request):
     return web.Response(text=CLIENT_HTML, content_type="text/html")
 
-
 async def page_mixer(_request: web.Request):
     return web.Response(text=MIXER_HTML, content_type="text/html")
 
-
-async def ws_audio(request: web.Request):
+async def offer(request: web.Request):
     """
-    WebSocket que recebe binário PCM int16 (mono) vindo do navegador do celular.
-    URL: /ws_audio?ch=1
+    Sinalização WebRTC:
+    recebe {sdp, type, ch} e responde {sdp, type} (answer).
     """
-    ws = web.WebSocketResponse(max_msg_size=10 * 1024 * 1024)
-    await ws.prepare(request)
+    data = await request.json()
+    ch_id = int(data.get("ch", 1))
+    sdp = data["sdp"]
+    typ = data["type"]
 
-    ch_id = int(request.query.get("ch", "1"))
-    print(f"[AUDIO] conectado: ch={ch_id} from {request.remote}")
+    offer = RTCSessionDescription(sdp=sdp, type=typ)
+    answer = await hub.add_webrtc_peer(ch_id, offer)
 
-    try:
-        async for msg in ws:
-            if msg.type == WSMsgType.BINARY:
-                hub.push_audio_frame(ch_id, msg.data)
-            elif msg.type == WSMsgType.ERROR:
-                print("[AUDIO] erro:", ws.exception())
-                break
-    finally:
-        await ws.close()
-        print(f"[AUDIO] desconectado: ch={ch_id}")
-
-    return ws
-
+    return web.json_response({"sdp": answer.sdp, "type": answer.type})
 
 async def ws_ctrl(request: web.Request):
-    """
-    WebSocket do painel /mixer para controlar canais.
-    """
     ws = web.WebSocketResponse(max_msg_size=2 * 1024 * 1024)
     await ws.prepare(request)
 
     hub._ctrl_clients.add(ws)
-    # envia state inicial
     await ws.send_json({"type": "state", "payload": hub.state_payload()})
 
     try:
@@ -665,24 +654,22 @@ async def ws_ctrl(request: web.Request):
 
     return ws
 
-
 async def ticker_task(app: web.Application):
-    # start audio once server is up
     hub.start_audio()
     try:
         while True:
+            hub.prune_inactive_channels(ttl_seconds=3.0)
             await hub.broadcast_tick()
-            await asyncio.sleep(0.20)  # 5x/s
+            await asyncio.sleep(0.20)
     finally:
         hub.stop_audio()
-
 
 def make_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/", page_mixer)
     app.router.add_get("/mixer", page_mixer)
     app.router.add_get("/client", page_client)
-    app.router.add_get("/ws_audio", ws_audio)
+    app.router.add_post("/offer", offer)
     app.router.add_get("/ws_ctrl", ws_ctrl)
 
     async def on_startup(app: web.Application):
@@ -701,11 +688,12 @@ def make_app() -> web.Application:
     app.on_cleanup.append(on_cleanup)
     return app
 
-
 if __name__ == "__main__":
     print(f"✅ Hub Mixer rodando em https://{HTTP_HOST}:{HTTP_PORT}")
     print(f"   - Mixer (PC):   https://192.168.100.218:{HTTP_PORT}/mixer")
     print(f"   - Client (cel): https://192.168.100.218:{HTTP_PORT}/client")
+
     ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ssl_ctx.load_cert_chain("cert.pem", "key.pem")
+
     web.run_app(make_app(), host=HTTP_HOST, port=HTTP_PORT, ssl_context=ssl_ctx)
