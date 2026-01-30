@@ -16,7 +16,7 @@ HTTP_HOST = "0.0.0.0"
 HTTP_PORT = 9000
 
 TARGET_SR = 48000
-FRAME_MS = 20
+FRAME_MS = 10
 SAMPLES_PER_FRAME = int(TARGET_SR * FRAME_MS / 1000)
 
 DEFAULT_CHANNEL_GAIN = 1.0
@@ -25,7 +25,7 @@ DEFAULT_LIMITER_CEILING = 0.98
 DEFAULT_GATE_THRESHOLD_RMS = 0.00
 DEFAULT_GATE_ATTENUATION = 0.15
 
-MAX_QUEUE_FRAMES = 10
+MAX_QUEUE_FRAMES = 50
 
 # =========================
 # HTML (client + mixer)
@@ -80,16 +80,18 @@ CLIENT_HTML = f"""<!doctype html>
     log("Pedindo permissão do microfone...");
     stream = await navigator.mediaDevices.getUserMedia({{
       audio: {{
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
+        channelCount: 1,
+        sampleRate: 48000
       }},
       video: false
     }});
 
     // WebRTC peer connection
     pc = new RTCPeerConnection({{
-      iceServers: [] // LAN: geralmente vazio é ok. Se for internet, adicione STUN/TURN.
+        iceServers: [{{ urls: "stun:stun.l.google.com:19302" }}] 
     }});
 
     pc.onconnectionstatechange = () => {{
@@ -98,6 +100,18 @@ CLIENT_HTML = f"""<!doctype html>
 
     // manda track de audio
     stream.getTracks().forEach(t => pc.addTrack(t, stream));
+    
+    try {{
+      const sender = pc.getSenders().find(s => s.track && s.track.kind === "audio");
+      if (sender) {{
+        const p = sender.getParameters();
+        p.encodings = p.encodings || [{{}}];
+        p.encodings[0].maxBitrate = 96000;
+        await sender.setParameters(p);
+      }}
+    }} catch(e) {{
+      console.log("setParameters/bitrate não aplicado:", e);
+    }}
 
     const offer = await pc.createOffer({{ offerToReceiveAudio: false, offerToReceiveVideo: false }});
     await pc.setLocalDescription(offer);
@@ -273,7 +287,7 @@ MIXER_HTML = """<!doctype html>
     meter.style.width = `${Math.min(100, Math.round(ch.level * 100))}%`;
 
     const warn = document.getElementById(`warn_${id}`);
-    warn.textContent = ch.queue_depth > 80 ? "buffer alto (latência)" : "";
+    warn.textContent = ch.queue_depth > 35 ? "buffer alto (latência)" : "";
   }
 
   function renderAll(payload) {
@@ -310,6 +324,7 @@ MIXER_HTML = """<!doctype html>
 </html>
 """
 
+
 # =========================
 # Mixer State
 # =========================
@@ -324,6 +339,7 @@ class ChannelState:
     drops: int = 0
     level: float = 0.0
     last_seen: float = field(default_factory=time.time)
+
 
 @dataclass
 class MasterState:
@@ -429,8 +445,7 @@ class HubMixer:
 
         ceiling = float(self.master.limiter_ceiling)
         ceiling = max(0.05, min(1.0, ceiling))
-        mix = np.clip(mix, -ceiling, ceiling)
-
+        mix = np.tanh(mix / ceiling) * ceiling
         return mix
 
     def _audio_callback(self, outdata, frames, time_info, status):
@@ -572,7 +587,9 @@ class HubMixer:
         for ch_id in dead:
             del self.channels[ch_id]
 
+
 hub = HubMixer()
+
 
 # =========================
 # HTTP Handlers
@@ -581,8 +598,10 @@ hub = HubMixer()
 async def page_client(_request: web.Request):
     return web.Response(text=CLIENT_HTML, content_type="text/html")
 
+
 async def page_mixer(_request: web.Request):
     return web.Response(text=MIXER_HTML, content_type="text/html")
+
 
 async def offer(request: web.Request):
     """
@@ -598,6 +617,7 @@ async def offer(request: web.Request):
     answer = await hub.add_webrtc_peer(ch_id, offer)
 
     return web.json_response({"sdp": answer.sdp, "type": answer.type})
+
 
 async def ws_ctrl(request: web.Request):
     ws = web.WebSocketResponse(max_msg_size=2 * 1024 * 1024)
@@ -654,6 +674,7 @@ async def ws_ctrl(request: web.Request):
 
     return ws
 
+
 async def ticker_task(app: web.Application):
     hub.start_audio()
     try:
@@ -663,6 +684,7 @@ async def ticker_task(app: web.Application):
             await asyncio.sleep(0.20)
     finally:
         hub.stop_audio()
+
 
 def make_app() -> web.Application:
     app = web.Application()
@@ -687,6 +709,7 @@ def make_app() -> web.Application:
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
     return app
+
 
 if __name__ == "__main__":
     print(f"✅ Hub Mixer rodando em https://{HTTP_HOST}:{HTTP_PORT}")
